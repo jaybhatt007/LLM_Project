@@ -31,15 +31,7 @@ def summarize_note(note_text):
 st.title("Note Summarizer")
 st.write("Enter your notes and get a summarized version of it.")
 
-note_text = st.text_area("Enter your note here:","")    # User input #
-
-if st.button("Summarize"):
-    if note_text:
-        summary = summarize_note(note_text)
-        st.subheader("Summary:")
-        st.write(summary)
-    else:
-        st.warning("Please enter a note to summarize.")
+#note_text = st.text_area("Enter your note here:","")    # User input #
 
 # Extracting the text from the doc file #
 
@@ -70,3 +62,15 @@ if uploaded_file:
         note_text = None
 else:
     note_text = st.text_area("Or enter your note here:", "")
+
+if st.button("Summarize" , key = "summary_file"):
+    if uploaded_file:
+        summary = summarize_note(note_text)
+        st.subheader("Summary:")
+        st.write(summary)
+    elif note_text:
+        summary = summarize_note(note_text)
+        st.subheader("Summary:")
+        st.write(summary)
+    else:
+        st.warning("Please enter a note or file to summarize.")
