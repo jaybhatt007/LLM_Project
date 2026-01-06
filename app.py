@@ -1,76 +1,145 @@
 import os
 from dotenv import load_dotenv
-import google.generativeai as genai
+from pathlib import Path
 import streamlit as st
-from docx import Document
-from PyPDF2 import PdfReader
+from google import genai
 
-# Loading the APi from .env #
+from utils.extract import extract_text_from_docx, extract_text_from_pdf
+from utils.summarizer import summarize, SummarizeConfig
+from utils.exports import to_markdown_bytes, to_docx_bytes, to_pdf_bytes
+from utils.db import init_db, save_summary, search_history, get_summary
+
+st.set_page_config(page_title="Note Summarizer V2", page_icon="📝", layout="wide")
+
+# Load .env
 load_dotenv()
-API_KEY = os.getenv("API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# defining the model of GenAi Model #
-genai.configure(api_key = API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+if not GOOGLE_API_KEY:
+    st.error("GOOGLE_API_KEY not found in .env. Add it and restart Streamlit.")
+    st.stop()
 
-# Writhing the Prompt what is needed from the model #
-def summarize_note(note_text):
-    prompt = f""" 
-    you are a helpful assistance. your task is to summarize the following notes in a clear, concise and easy ti understand format.
-    Pleaser summarize the key points while preserving the important information. avoid unnecessary details.
+client = genai.Client(api_key=GOOGLE_API_KEY)
 
-    Note:
-    {note_text}
-    """
-    response = model.generate_content(prompt)
-    result = response.text
-    return result
+# Sidebar history
+st.sidebar.title("📚 History")
+init_db()
+q = st.sidebar.text_input("Search history", "")
+items = search_history(q, limit=50)
 
-# Using Streamlit UI for web interface #
+selected_id = None
+if items:
+    labels = ["(none)"]
+    mapping = {}
+    for it in items:
+        fname = it.get("filename") or it.get("source_type")
+        label = f"#{it['id']} • {fname} • {it['mode']} • {it['created_at']}"
+        labels.append(label)
+        mapping[label] = it["id"]
 
-st.title("Note Summarizer")
-st.write("Enter your notes and get a summarized version of it.")
+    choice = st.sidebar.selectbox("Load previous summary", labels)
+    if choice != "(none)":
+        selected_id = mapping[choice]
 
-#note_text = st.text_area("Enter your note here:","")    # User input #
+st.title("📝 Note Summarizer V2")
+st.write("Upload PDF/DOCX or paste text. Choose mode, length, citations. Export to MD/DOCX/PDF + save history.")
 
-# Extracting the text from the doc file #
+# Controls
+c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1])
 
-def extract_text_from_docx(file):
-    document = Document(file)
-    full_text = [paragraph.text for paragraph in document.paragraphs]
-    return "\n".join(full_text)
+with c1:
+    mode = st.selectbox("Mode", ["Bullets", "Key Takeaways", "Action Items", "Study Notes", "Flashcards"], index=0)
+with c2:
+    length = st.selectbox("Length", ["Short", "Medium", "Long"], index=1)
+with c3:
+    include_citations = st.checkbox("PDF page citations", value=True)
+with c4:
+    model_name = st.selectbox("Model", ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"], index=0)
 
-# Extracting  the text from the PDF file #
+st.divider()
 
-def  extract_text_from_pdf(file):
-    pdf_reader = PdfReader(file)
-    full_text = [page.extract_text() for page in pdf_reader.page]
-    return "\n".join(full_text)
+uploaded = st.file_uploader("Upload a file (.docx, .pdf):", type=["docx", "pdf"])
 
+note_text = ""
+pages = None
+source_type = "text"
+filename = None
+MAX_PDF_PAGES = 120
 
-# Determing the file type #
-
-uploaded_file = st.file_uploader("Upload a file (.docx, .pdf):" , type=["docx","pdf"]) # Uploading a file #
-
-if uploaded_file:
-    if uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        note_text = extract_text_from_docx(uploaded_file)
-    elif uploaded_file == "application/pdf":
-        note_text = extract_text_from_pdf(uploaded_file)
-    else:
-        st.error("Unsupported file type.")
-        note_text = None
+if uploaded:
+    filename = uploaded.name
+    if uploaded.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        extracted = extract_text_from_docx(uploaded)
+        note_text, pages = extracted.text, None
+        source_type = "docx"
+    elif uploaded.type == "application/pdf":
+        extracted = extract_text_from_pdf(uploaded, max_pages=MAX_PDF_PAGES)
+        note_text, pages = extracted.text, extracted.pages
+        source_type = "pdf"
+        if (pages and len(pages) >= MAX_PDF_PAGES):
+            st.info(f"PDF limited to first {MAX_PDF_PAGES} pages for safety/performance.")
 else:
-    note_text = st.text_area("Or enter your note here:", "")
+    note_text = st.text_area("Or paste your notes:", "", height=220)
 
-if st.button("Summarize" , key = "summary_file"):
-    if uploaded_file:
-        summary = summarize_note(note_text)
-        st.subheader("Summary:")
-        st.write(summary)
-    elif note_text:
-        summary = summarize_note(note_text)
-        st.subheader("Summary:")
-        st.write(summary)
-    else:
-        st.warning("Please enter a note or file to summarize.")
+with st.expander("Preview extracted text"):
+    st.write(note_text[:2000] + ("..." if len(note_text) > 2000 else ""))
+
+cfg = SummarizeConfig(
+    model=model_name,
+    mode=mode,
+    length=length,
+    include_citations=(include_citations and source_type == "pdf")
+)
+
+@st.cache_data(show_spinner=False)
+def cached_run(text: str, cfg_dict: dict, pages_small):
+    cfg_obj = SummarizeConfig(**cfg_dict)
+    return summarize(client, text, cfg_obj, pages=pages_small)
+
+run = st.button("✨ Summarize", type="primary")
+summary = None
+
+if run:
+    if not note_text.strip():
+        st.warning("Please upload a file or paste text.")
+        st.stop()
+
+    with st.spinner("Summarizing..."):
+        pages_small = pages if cfg.include_citations else None
+        summary = cached_run(
+            note_text,
+            cfg_dict={
+                "model": cfg.model,
+                "mode": cfg.mode,
+                "length": cfg.length,
+                "include_citations": cfg.include_citations,
+            },
+            pages_small=pages_small,
+        )
+
+    st.subheader("✅ Summary")
+    st.write(summary)
+
+    save_summary(filename, source_type, mode, length, model_name, len(note_text), summary)
+
+    st.subheader("⬇️ Export")
+    e1, e2, e3 = st.columns(3)
+
+    md_name = f"{Path(filename).stem}_summary.md" if filename else "summary.md"
+    docx_name = f"{Path(filename).stem}_summary.docx" if filename else "summary.docx"
+    pdf_name = f"{Path(filename).stem}_summary.pdf" if filename else "summary.pdf"
+
+    with e1:
+        st.download_button("Download .md", to_markdown_bytes(summary), file_name=md_name, mime="text/markdown")
+    with e2:
+        st.download_button("Download .docx", to_docx_bytes("Summary", summary), file_name=docx_name,
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    with e3:
+        st.download_button("Download .pdf", to_pdf_bytes("Summary", summary), file_name=pdf_name, mime="application/pdf")
+
+# Show loaded history
+if selected_id and not run:
+    saved = get_summary(int(selected_id))
+    if saved:
+        st.subheader(f"📌 Loaded Summary #{saved['id']}")
+        st.write(saved["summary"])
